@@ -1,0 +1,205 @@
+TSX Stock Analysis for 2015
+========================================================
+author: Nicolaas Kuit
+date: 23-Jun-2017
+autosize: true
+
+Buy lower vs higher priced stocks?
+========================================================
+
+- We'll look at the daily close prices of 339 TSX securities from Jan 1, 2015 - Dec 31, 2015.
+    + Each security has prices for the entire year, and belonged to an index at that time.
+
+- *Question 1*: Is there a difference in PnL % terms between low and high priced stocks?
+- *Question 2*: With a Simple Moving Average (SMA), long only algorithm, is there a difference in PnL % terms between low and high priced stocks?
+
+Profit & Loss % (PnL) for low & high priced stocks
+========================================================
+left: 60%
+<small>
+- Buy the stock at each day, and sell it **50 days later**, for all days of the year.
+- The average PnL % is calculated for each of these trades, for each stock.
+- Based on the average starting (buy) price, each stock is categorized into low/mid/high.
+</small>
+
+```{r echo=FALSE}
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(tidyr)
+library(TTR)
+
+rawPrices <- read.csv("TsxPriceData.csv", stringsAsFactors = FALSE, header = TRUE)
+rawPrices$PriceDate <- dmy(rawPrices$PriceDate)
+
+# Transform prices into cross tab format where columns are the close price
+# of each stock. Each row is the close price for all stocks for a particular day.
+ctpricesWithDate <- spread(rawPrices, YahooSymbol, Close)
+
+# Remove all the columns (stocks) which have NAs. This means we have price data mid
+# way through the year for that stock. Also remove PriceDate since we don't need it
+ctprices <- select(ctpricesWithDate, -which(colSums(is.na(ctpricesWithDate)) > 0), -PriceDate)
+
+numPrices <- nrow(ctprices)
+numDaysAhead <- 50
+
+# Calculate the percentage price change over the days specified, and do this for all days.
+# So first date + numDays price change, 2nd date + numDays price change, etc...
+priceChanges <- 100 * (ctprices[(numDaysAhead + 1):numPrices,] / ctprices[1:(numPrices - numDaysAhead),] - 1)
+
+# Now get the mean price change (%) for the entire year for all stocks
+meanPriceChanges <- colMeans(priceChanges)
+
+# Get the mean starting price for all stocks
+meanStartingPrices <- colMeans(ctprices[1:(numPrices - numDaysAhead),])
+
+
+# Make a factor for each stock to say which of 3 price ranges it is in (low, mid, high)
+startingPriceFactor <- cut(meanStartingPrices, 
+                           quantile(meanStartingPrices, c(0, 1/3, 2/3, 1)), 
+                           labels = c("Low", "Mid", "High"), 
+                           include.lowest = TRUE)
+
+plotData <- data.frame(stock = names(meanPriceChanges), meanPriceChange = meanPriceChanges, priceFactor = startingPriceFactor)
+```
+
+<small>
+T-Test between price change % of Low and High starting prices:
+</small>
+
+```{r echo=FALSE}
+tTestResult <- t.test(filter(plotData, priceFactor == "Low")$meanPriceChange, 
+                         filter(plotData, priceFactor == "High")$meanPriceChange, 
+                         alternative = "two.sided")
+```
+<small>
+p-value: `r tTestResult$p.value` > 0.05, so we **can not** say that there is a difference between Low and High priced stocks.
+</small>
+
+***
+```{r echo=FALSE}
+g <- ggplot(data = plotData, aes(x = priceFactor, y = meanPriceChange, fill = priceFactor)) + 
+            geom_boxplot() +
+            theme(legend.position = "none") +
+            xlab("Price Category") +
+            ylab("Mean Price Change %")
+
+print(g)
+```
+
+Simple Algorithm: PnL % between low vs high priced stocks?
+========================================================
+left: 60%
+
+<small>
+- Buys when the price is above SMA, & sell next time the price is below the SMA.
+- The average PnL % is calculated for each stock.
+- Price category from previous slide is used.
+</small>
+      
+```{r, echo=FALSE}
+numDaysSMA <- 20
+smas <- as.data.frame(lapply(ctprices, SMA, numDaysSMA), check.names = FALSE)
+
+buys <- ctprices > smas
+buys[is.na(buys)] <- FALSE
+
+sells <- ctprices < smas
+sells[is.na(sells)] <- FALSE
+
+# Create buy signals
+buysPrevDay <- buys
+# Set first row to FALSE
+buysPrevDay[1,] <- FALSE
+# Shift all the rows in buys down by one
+buysPrevDay[2:numPrices,] <- buys[1:(numPrices - 1),]
+# A signal is created when there is a change from previous day to today
+buySignals <- buys & !buysPrevDay
+
+# Create sell signals
+sellsPrevDay <- sells
+sellsPrevDay[1,] <- FALSE
+sellsPrevDay[2:numPrices,] <- sells[1:(numPrices - 1),]
+sellSignals <- sells & !sellsPrevDay
+
+# Create a factor which tells us which price is a buy/sell/nosignal
+# First create an empty copy of buys
+signals <- as.data.frame(buySignals * -1 + sellSignals * 1, check.names = FALSE)
+plotSignals <- as.data.frame(lapply(signals, factor, levels = c(-1, 0, 1), labels = c("buy", "nosignal", "sell"), ordered = TRUE), check.names = FALSE)
+
+signals[numDaysSMA, signals[numDaysSMA,] == 1] <- 0
+plotSignals[numDaysSMA, plotSignals[numDaysSMA,] == "sell"] <- "nosignal"
+
+# Add date back into plotSignals for plotting
+plotSignals$PriceDate <- ctpricesWithDate$PriceDate
+
+
+# Figure out Profit & Loss
+pnLs <- ctprices
+pnLs[,] <- NA
+
+buySellPrices <- signals * ctprices
+
+# For each stock:
+for(stockIdx in 1:ncol(buySellPrices)) {
+    trades <- select(buySellPrices, stockIdx)
+    
+    buyIdx <- 0
+    buyPrice <- 0
+    
+    # Find a buy, then find the next sell, and calculate the PnL for that buy
+    # and store the % pnl in that buy's cell (in pnLs)
+    for(tradeIdx in 1:nrow(trades)) {
+        tradePrice <- trades[tradeIdx, 1]
+        
+        # Check if it's a buy. Buys were made negative before, and sells are positive
+        if(tradePrice < 0) {
+            buyIdx <- tradeIdx
+            buyPrice <- tradePrice
+        }
+        else if(tradePrice > 0) {
+            # we found a sell, which must be related to the previous buy
+            pnLs[buyIdx, stockIdx] <- 100 * ((-1 * tradePrice) / buyPrice - 1)
+            buyIdx <- 0
+        }
+    }
+}
+
+# Calculate mean PnL for each stock
+pnLMeans <- colMeans(pnLs, na.rm = TRUE)
+
+smaPNLMeanData <- data.frame(stock = names(pnLMeans), 
+                             meanPnL = pnLMeans, 
+                             priceFactor = startingPriceFactor)
+```
+<small>
+T-Test between PnL % of Low and High starting prices:
+</small>
+```{r echo=FALSE}
+tTestResult <- t.test(filter(smaPNLMeanData, priceFactor == "Low")$meanPnL, 
+                         filter(smaPNLMeanData, priceFactor == "High")$meanPnL, 
+                         alternative = "two.sided")
+```
+<small>
+p-value: `r tTestResult$p.value` > 0.05, so we **can not** say that there is a difference between Low & High priced stocks.
+</small>
+
+***
+
+```{r echo=FALSE}
+g <- ggplot(data = smaPNLMeanData, aes(x = priceFactor, y = meanPnL, fill = priceFactor)) + 
+            geom_boxplot() +
+            theme(legend.position = "none") +
+            xlab("Price Category") +
+            ylab("Mean PnL Change %")
+
+print(g)
+```
+
+Conclusions
+========================================================
+- We can only generalize about 2015.
+- For the T-test, we have to assume the price and PnL percentages are normally distributed.
+- The TSX market in general was in a downward trend for the entire 2015, so it makes sense that the PnL in the SMA strategy is negative.
+
+- Based on the data analysed, there is **no difference** between buying **lower** priced stocks versus buying **higher** priced stocks.
